@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-CODE_PATH=.
+CODE_PATH=../..
 cd ${CODE_PATH}
 export PYTHONPATH=$CODE_PATH:$PYTHONPATH
 

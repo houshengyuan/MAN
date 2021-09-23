@@ -97,6 +97,7 @@ class TransformerModel(FairseqModel):
                             help='sets adaptive softmax dropout for the tail projections')
         parser.add_argument('--macaron', action='store_true',
                             help='use the macaron network')
+        parser.add_argument('--using-distance-prior', type=int, default=1)
 
     @classmethod
     def build_model(cls, args, task):
@@ -250,6 +251,7 @@ class TransformerEncoder(FairseqEncoder):
             learned=args.encoder_learned_pos,
         ) if not args.no_token_positional_embeddings else None
 
+        self.using_distance_prior=getattr(args, 'using_distance_prior', '0')
         self.layers = nn.ModuleList([])
         self.layers.extend([
             TransformerEncoderLayer(args)
@@ -260,7 +262,7 @@ class TransformerEncoder(FairseqEncoder):
         if self.normalize:
            self.layer_norm = LayerNorm(embed_dim)
 
-    def forward(self, src_tokens, src_lengths):
+    def forward(self, src_tokens, src_lengths, prev_output_tokens, src_distance=None):
         """
         Args:
             src_tokens (LongTensor): tokens in the source language of shape
@@ -291,7 +293,13 @@ class TransformerEncoder(FairseqEncoder):
 
         # encoder layers
         for layer in self.layers:
-            x = layer(x, encoder_padding_mask)
+            if self.using_distance_prior:
+                d = torch.stack((src_distance, src_distance), -1)
+                d = d.permute(1, 0, 2)
+                x = layer(x, encoder_padding_mask, distances=d)
+            else:
+                x = layer(x, encoder_padding_mask, distances=None)
+
 
         if self.normalize:
             x = self.layer_norm(x)

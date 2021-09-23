@@ -8,6 +8,7 @@
 import itertools
 import numpy as np
 import os
+import torch
 
 from torch.utils.data import ConcatDataset
 
@@ -19,6 +20,19 @@ from fairseq.data import (
 
 from . import FairseqTask, register_task
 
+class Distance_prior_dataset(torch.utils.data.Dataset):
+    def __init__(self, root, size, split, name):
+        super(Distance_prior_dataset, self).__init__()
+        assert split in ['train', 'valid', 'test']
+        assert name in ['iwslt14de2en','iwslt14en2de','wmt14en2de','aspecch2ja']
+        self.dataset_size = size
+        self.src_path = os.path.join(root, 'experimental/distance_prior/{}/{}/'.format(name,split))
+    def __len__(self):
+        return self.dataset_size
+    def __getitem__(self, item):
+        distance = np.load(os.path.join(self.src_path, '{}.npy'.format(item)))
+        distance = torch.from_numpy(distance)
+        return distance
 
 @register_task('translation')
 class TranslationTask(FairseqTask):
@@ -62,6 +76,10 @@ class TranslationTask(FairseqTask):
                             help='max number of tokens in the target sequence')
         parser.add_argument('--upsample-primary', default=1, type=int,
                             help='amount to upsample primary dataset')
+        parser.add_argument('--task-name', default="iwslt14de2en", type=str,
+                            help='task name')
+        parser.add_argument('--generate-distance', default=False, type=bool,
+                            help='whether or not it\'s generating distance')
 
     def __init__(self, args, src_dict, tgt_dict):
         super().__init__(args)
@@ -95,7 +113,7 @@ class TranslationTask(FairseqTask):
 
         return cls(args, src_dict, tgt_dict)
 
-    def load_dataset(self, split, combine=False):
+    def load_dataset(self, split, combine=False,generate_distance=False,task=None,):
         """Load a given dataset split.
 
         Args:
@@ -164,6 +182,13 @@ class TranslationTask(FairseqTask):
             src_sizes = np.concatenate([ds.sizes for ds in src_datasets])
             tgt_sizes = np.concatenate([ds.sizes for ds in tgt_datasets])
 
+        # add distance prior information
+        if generate_distance == False:
+            src_distance_dataset = Distance_prior_dataset(root='/home/syhou/distance-transformer/', split=split,
+                                                          size=src_dataset.sizes, name=task)
+        else:
+            src_distance_dataset=None
+
         self.datasets[split] = LanguagePairDataset(
             src_dataset, src_sizes, self.src_dict,
             tgt_dataset, tgt_sizes, self.tgt_dict,
@@ -171,6 +196,7 @@ class TranslationTask(FairseqTask):
             left_pad_target=self.args.left_pad_target,
             max_source_positions=self.args.max_source_positions,
             max_target_positions=self.args.max_target_positions,
+            src_dist=src_distance_dataset,
         )
 
     def max_positions(self):

@@ -32,7 +32,7 @@ def main(args):
 
     # Load dataset splits
     task = tasks.setup_task(args)
-    task.load_dataset(args.gen_subset)
+    task.load_dataset(args.gen_subset,task=args.task_name)
     print('| {} {} {} examples'.format(args.data, args.gen_subset, len(task.dataset(args.gen_subset))))
 
     # Set dictionaries

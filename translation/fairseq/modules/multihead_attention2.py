@@ -20,7 +20,7 @@ class MultiheadAttention2(nn.Module):
     """
 
     def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False,
-                 add_zero_attn=False, re_weight_m=0, max_len=1024):
+                 add_zero_attn=False, re_weight_m=1, max_len=1024, re_weight_d=1):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -48,13 +48,29 @@ class MultiheadAttention2(nn.Module):
         assert isinstance(re_weight_m, int) and re_weight_m >= 0
         self.re_weight_m = re_weight_m
 
+        """re-weight the score of attention matrix by syntactic distance"""
+        assert isinstance(re_weight_d, int) and re_weight_d >= 0
+        self.re_weight_d = re_weight_d
+
+        if self.re_weight_d==1:
+            self.re_weight_m=0
+        else:
+            self.re_weight_m=1
+        t=self.re_weight_m^self.re_weight_d
+        assert t==1
+
         if self.re_weight_m == 1:
             self.forward_position_x = Parameter(torch.Tensor(max_len))
             self.backward_position_x = Parameter(torch.Tensor(max_len))
             self.head_x = Parameter(torch.Tensor(self.num_heads))
             self.context_x_fc = nn.Linear(self.embed_dim, 1, False)
+        elif self.re_weight_d == 1:
+            self.forward_position_x = Parameter(torch.Tensor(self.num_heads,max_len))
+            self.backward_position_x = Parameter(torch.Tensor(self.num_heads,max_len))
+            self.head_x = None
+            self.context_x_fc = nn.Linear(self.embed_dim, 1, False)
         else:
-            self.forward_position_x = self.backward_position_x = self.head_x = self.context_x_fc = None
+            self.forward_position_x = self.backward_position_x = self.head_x = self.context_x_fc = self.mask_x_fc = None
 
         self.reset_parameters()
 
@@ -87,8 +103,10 @@ class MultiheadAttention2(nn.Module):
 
         if self.re_weight_m == 1:
 
-            assert 'context' in kw and 'key_len' in kw and 'bsz' in kw
-            context, key_len, bsz = kw['context'], kw['key_len'], kw['bsz']
+            assert 'context' in kw and 'mask' in kw and 'key_len' in kw and 'bsz' in kw
+            context, mask, key_len, bsz = kw['context'], kw['mask'], kw['key_len'], kw['bsz']
+
+            assert mask==None
 
             if context.size(0) != bsz:
                 assert context.size(1) == bsz
@@ -126,8 +144,49 @@ class MultiheadAttention2(nn.Module):
             else:
                 return log_weights[:, :, -1].unsqueeze(2)
 
+        elif self.re_weight_d==1:
+
+            assert 'context' in kw and 'mask' in kw and 'key_len' in kw and 'bsz' in kw
+            context, mask, key_len, bsz = kw['context'], kw['mask'], kw['key_len'], kw['bsz']
+
+            if context.size(0) != bsz:
+                assert context.size(1) == bsz
+                context = context.transpose(0, 1)
+
+            mask=mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1)
+
+            """ position based -- gamma"""
+            forward_x = self.forward_position_x
+            backward_x = self.backward_position_x
+            self_x = torch.zeros(self.num_heads,1).type_as(backward_x)
+            position_x = torch.cat([forward_x, self_x, backward_x], 1)
+
+            max_x_len = position_x.size(-1)
+            half_max_x_len = (max_x_len + 1) // 2
+
+            indices = torch.arange(key_len).unsqueeze(0).repeat(key_len, 1). \
+                add(torch.arange(half_max_x_len - key_len, half_max_x_len).flip([0]).unsqueeze(1)). \
+                view(-1).long().cuda()
+            position_x = position_x[:,indices].view(self.num_heads,key_len, key_len).unsqueeze(0).repeat(bsz,1,1,1)
+
+            assert mask.shape==position_x.shape
+
+            """position and head based -- gamma
+              gamma num_heads * key_len * key_len"""
+            x = mask*position_x
+
+            """ context weight based -- x"""
+            context_x = self.context_x_fc(context).unsqueeze(1)
+
+            log_weights = context_x.add(x).sigmoid().clamp(1e-10).log()
+
+            if key_len == context.size(1):
+                return log_weights
+            else:
+                return log_weights[:, :, -1].unsqueeze(2)
+
     def forward(self, query, key, value, key_padding_mask=None, incremental_state=None,
-                need_weights=True, static_kv=False, attn_mask=None):
+                need_weights=True, static_kv=False, attn_mask=None,distances=None,):
         """Input shape: Time x Batch x Channel
 
         Self-attention can be implemented by passing in the same arguments for
@@ -225,11 +284,58 @@ class MultiheadAttention2(nn.Module):
         if attn_mask is not None:
             attn_weights += attn_mask.unsqueeze(0)
 
+        if distances is not None:
+            pretext_dist = distances[:, :, 0].permute(1, 0)  # (B, T-1)
+            alpha_pre = (
+                    (F.hardtanh(
+                        (pretext_dist[:, :, None] - pretext_dist[:, None, :]) / 1 + 1
+                    ) + 1) / 2
+            ).tril()  # B, T-1, T-1
+            alpha_pre = torch.cat((
+                torch.zeros([bsz, 1, src_len],
+                            dtype=alpha_pre.dtype,
+                            device=alpha_pre.device),
+                torch.cat((alpha_pre,
+                           torch.zeros([bsz, src_len - 1, 1],
+                                       dtype=alpha_pre.dtype,
+                                       device=alpha_pre.device)
+                           ), dim=-1)
+            ), dim=-2)
+            alpha_pre = alpha_pre + torch.ones_like(alpha_pre).triu(diagonal=0)
+            gate_pre = torch.cumprod(alpha_pre.flip(dims=[-1]), dim=-1).flip(dims=[-1])
+
+            postext_dist = distances[:, :, 1].permute(1, 0)
+            alpha_pos = (
+                    (F.hardtanh(
+                        (postext_dist[:, :, None] - postext_dist[:, None, :]) / 1 + 1
+                    ) + 1) / 2
+            ).triu()
+            alpha_pos = torch.cat((
+                torch.cat((torch.zeros([bsz, src_len - 1, 1],
+                                       dtype=alpha_pos.dtype,
+                                       device=alpha_pos.device),
+                           alpha_pos
+                           ), dim=-1),
+                torch.zeros([bsz, 1, src_len],
+                            dtype=alpha_pos.dtype,
+                            device=alpha_pos.device)
+            ), dim=-2)
+
+            alpha_pos = alpha_pos + torch.ones_like(alpha_pos).tril(diagonal=0)
+            gate_pos = torch.cumprod(alpha_pos, dim=-1)
+
+            distance_mask = gate_pre + gate_pos - 1
+        else:
+            distance_mask = None
+
         if key_padding_mask is not None or self.re_weight_m == 1:
             # don't attend to padding symbols
             attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
             if self.re_weight_m == 1:
-                log_weights = self.build_mask(context=query, key_len=src_len, bsz=bsz)
+                log_weights = self.build_mask(context=query, mask=None, key_len=src_len, bsz=bsz)
+                attn_weights += log_weights
+            elif self.re_weight_d == 1:
+                log_weights = self.build_mask(context=query, mask=distance_mask, key_len=src_len, bsz=bsz)
                 attn_weights += log_weights
             if key_padding_mask is not None:
                 mask = key_padding_mask.unsqueeze(1).unsqueeze(2)

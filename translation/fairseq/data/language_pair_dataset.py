@@ -28,11 +28,15 @@ def collate(
 
     id = torch.LongTensor([s['id'] for s in samples])
     src_tokens = merge('source', left_pad=left_pad_source)
+    src_distance = merge("source_distance",left_pad=left_pad_source)
+
+
     # sort by descending source length
     src_lengths = torch.LongTensor([s['source'].numel() for s in samples])
     src_lengths, sort_order = src_lengths.sort(descending=True)
     id = id.index_select(0, sort_order)
     src_tokens = src_tokens.index_select(0, sort_order)
+    src_distance = src_distance.index_select(0, sort_order)
 
     prev_output_tokens = None
     target = None
@@ -65,6 +69,8 @@ def collate(
     }
     if prev_output_tokens is not None:
         batch['net_input']['prev_output_tokens'] = prev_output_tokens
+    if src_distance is not None:
+        batch['net_input']['src_distance'] = src_distance
     return batch
 
 
@@ -99,7 +105,7 @@ class LanguagePairDataset(FairseqDataset):
         tgt=None, tgt_sizes=None, tgt_dict=None,
         left_pad_source=True, left_pad_target=False,
         max_source_positions=1024, max_target_positions=1024,
-        shuffle=True, input_feeding=True,
+        shuffle=True, input_feeding=True,src_dist=None,
     ):
         if tgt_dict is not None:
             assert src_dict.pad() == tgt_dict.pad()
@@ -117,12 +123,18 @@ class LanguagePairDataset(FairseqDataset):
         self.max_target_positions = max_target_positions
         self.shuffle = shuffle
         self.input_feeding = input_feeding
+        # added features in distance-transformer
+        if src_dist is not None:
+            self.src_dist = src_dist
+        else:
+            self.src_dist = None
 
     def __getitem__(self, index):
         return {
             'id': index,
             'source': self.src[index],
             'target': self.tgt[index] if self.tgt is not None else None,
+            'source_distance': self.src_dist[index] if self.src_dist is not None else None,
         }
 
     def __len__(self):
@@ -172,11 +184,7 @@ class LanguagePairDataset(FairseqDataset):
         )
         bsz = num_tokens // max(src_len, tgt_len)
         return self.collater([
-            {
-                'id': i,
-                'source': self.src_dict.dummy_sentence(src_len),
-                'target': self.tgt_dict.dummy_sentence(tgt_len) if self.tgt_dict is not None else None,
-            }
+            self.__getitem__(i)
             for i in range(bsz)
         ])
 

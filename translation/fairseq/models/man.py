@@ -18,7 +18,7 @@ from fairseq import utils
 
 from fairseq.modules import (
     AdaptiveSoftmax, LearnedPositionalEmbedding,
-    SinusoidalPositionalEmbedding, MultiheadAttention2 as MultiheadAttention,
+    SinusoidalPositionalEmbedding, MultiheadAttention, MultiheadAttention2,
 )
 
 from . import (
@@ -103,6 +103,8 @@ class MANModel(FairseqModel):
                             help='use three-sublayer in encoder')
         parser.add_argument('--no-man-decoder', action='store_true',
                             help='use three-sublayer in decoder')
+        parser.add_argument('--using-distance-prior', type=bool, default=False,
+                            help='use syntactic distance parsing information')
 
     @classmethod
     def build_model(cls, args, task):
@@ -184,6 +186,8 @@ class MANEncoder(FairseqEncoder):
             learned=args.encoder_learned_pos,
         ) if not args.no_token_positional_embeddings else None
 
+        self.using_distance_prior = getattr(args, 'using_distance_prior', '0')
+
         self.encoder_mix_layers = getattr(args, "encoder_mix_layers", 0)
         self.layers = nn.ModuleList([])
         self.layers.extend([
@@ -197,7 +201,7 @@ class MANEncoder(FairseqEncoder):
         if self.normalize:
            self.layer_norm = LayerNorm(embed_dim)
 
-    def forward(self, src_tokens, src_lengths):
+    def forward(self, src_tokens, src_lengths, src_distance=None):
         """
         Args:
             src_tokens (LongTensor): tokens in the source language of shape
@@ -227,8 +231,13 @@ class MANEncoder(FairseqEncoder):
         #     encoder_padding_mask = None
 
         # encoder layers
+        d = torch.stack((src_distance, src_distance), -1)
+        d = d.permute(1, 0, 2)
         for layer in self.layers:
-            x = layer(x, encoder_padding_mask)
+            if self.using_distance_prior :
+                x = layer(x, encoder_padding_mask, distances=d)
+            else:
+                x = layer(x, encoder_padding_mask,distances=None)
 
         if self.normalize:
             x = self.layer_norm(x)
@@ -478,8 +487,8 @@ class MANEncoderLayer(nn.Module):
     def __init__(self, args, mix=False, no_man=False):
         super().__init__()
         self.embed_dim = args.encoder_embed_dim
-        self.self_attn = MultiheadAttention(
-            self.embed_dim, args.encoder_attention_heads,
+        self.self_attn = MultiheadAttention2(
+            self.embed_dim,args.encoder_attention_heads,
             dropout=args.attention_dropout,
         )
 
@@ -497,17 +506,17 @@ class MANEncoderLayer(nn.Module):
                 self.pre_fc1 = Linear(self.embed_dim, args.encoder_ffn_embed_dim)
                 self.pre_fc2 = Linear(args.encoder_ffn_embed_dim, self.embed_dim)
             else:
-                self.pre_self_attn = MultiheadAttention(
+                self.pre_self_attn = MultiheadAttention2(
                     self.embed_dim, args.encoder_attention_heads,
                     dropout=args.attention_dropout,
-                    re_weight_m=1,
+                    re_weight_d=args.using_distance_prior,
                     max_len=args.max_source_positions
                 )
             n_layernorm += 1
 
         self.layer_norms = nn.ModuleList([LayerNorm(self.embed_dim) for i in range(n_layernorm)])
 
-    def forward(self, x, encoder_padding_mask):
+    def forward(self, x, encoder_padding_mask, distances=None):
         """
         Args:
             x (Tensor): input to the layer of shape `(seq_len, batch, embed_dim)`
@@ -517,39 +526,42 @@ class MANEncoderLayer(nn.Module):
         Returns:
             encoded output of shape `(batch, src_len, embed_dim)`
         """
+        layer_norm_id=0
         if not self.no_man:
             if not self.mix:
                 residual = x
-                x = self.maybe_layer_norm(0, x, before=True)
+                x = self.maybe_layer_norm(layer_norm_id, x, before=True)
                 x = F.relu(self.pre_fc1(x))
                 x = F.dropout(x, p=self.relu_dropout, training=self.training)
                 x = self.pre_fc2(x)
                 x = F.dropout(x, p=self.dropout, training=self.training)
                 x = residual + x
-                x = self.maybe_layer_norm(0, x, after=True)
+                x = self.maybe_layer_norm(layer_norm_id, x, after=True)
             else:
                 residual = x
-                x = self.maybe_layer_norm(0, x, before=True)
-                x, _ = self.pre_self_attn(query=x, key=x, value=x, key_padding_mask=encoder_padding_mask)
+                x = self.maybe_layer_norm(layer_norm_id, x, before=True)
+                x, _ = self.pre_self_attn(query=x, key=x, value=x ,key_padding_mask=encoder_padding_mask,distances=distances)
                 x = F.dropout(x, p=self.dropout, training=self.training)
                 x = residual + x
-                x = self.maybe_layer_norm(0, x, after=True)
+                x = self.maybe_layer_norm(layer_norm_id, x, after=True)
+            layer_norm_id+=1
 
         residual = x
-        x = self.maybe_layer_norm(1, x, before=True)
+        x = self.maybe_layer_norm(layer_norm_id, x, before=True)
         x, _ = self.self_attn(query=x, key=x, value=x, key_padding_mask=encoder_padding_mask)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
-        x = self.maybe_layer_norm(1, x, after=True)
+        x = self.maybe_layer_norm(layer_norm_id, x, after=True)
 
+        layer_norm_id+=1
         residual = x
-        x = self.maybe_layer_norm(2, x, before=True)
+        x = self.maybe_layer_norm(layer_norm_id, x, before=True)
         x = F.relu(self.fc1(x))
         x = F.dropout(x, p=self.relu_dropout, training=self.training)
         x = self.fc2(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
-        x = self.maybe_layer_norm(2, x, after=True)
+        x = self.maybe_layer_norm(layer_norm_id, x, after=True)
         return x
 
     def maybe_layer_norm(self, i, x, before=False, after=False):
@@ -589,7 +601,7 @@ class MANDecoderLayer(nn.Module):
                 self.pre_fc1 = Linear(self.embed_dim, args.decoder_ffn_embed_dim)
                 self.pre_fc2 = Linear(args.decoder_ffn_embed_dim, self.embed_dim)
             else:
-                self.pre_self_attn = MultiheadAttention(
+                self.pre_self_attn = MultiheadAttention2(
                     self.embed_dim, args.decoder_attention_heads,
                     dropout=args.attention_dropout,
                     re_weight_m=1,

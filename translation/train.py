@@ -35,7 +35,7 @@ def main(args):
     task = tasks.setup_task(args)
 
     # Load dataset splits
-    load_dataset_splits(task, ['train', 'valid'])
+    load_dataset_splits(task, ['train', 'valid'], args.task_name)
 
     # Build model and criterion
     model = task.build_model(args)
@@ -328,15 +328,15 @@ def load_checkpoint(args, trainer, epoch_itr):
     return False
 
 
-def load_dataset_splits(task, splits):
+def load_dataset_splits(task, splits, task_name):
     for split in splits:
         if split == 'train':
-            task.load_dataset(split, combine=True)
+            task.load_dataset(split, combine=True,task=task_name)
         else:
             for k in itertools.count():
                 split_k = split + (str(k) if k > 0 else '')
                 try:
-                    task.load_dataset(split_k, combine=False)
+                    task.load_dataset(split_k, combine=False,task=task_name)
                 except FileNotFoundError as e:
                     if k > 0:
                         break
